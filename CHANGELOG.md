@@ -2,7 +2,7 @@
 
 When a version is released, its section here becomes the GitHub release notes.
 
-## [Unreleased]
+## [0.2.1] - 2026-10-06
 
 Let the engine forward to a configurable upstream, so a local provider switcher can stay in the path.
 
