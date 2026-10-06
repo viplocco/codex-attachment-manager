@@ -2,6 +2,16 @@
 
 When a version is released, its section here becomes the GitHub release notes.
 
+## [Unreleased]
+
+Let the engine forward to a configurable upstream, so a local provider switcher can stay in the path.
+
+### Features
+
+- `CAM_UPSTREAM_URL` and `--upstream` point the engine at any HTTP or HTTPS origin; the default stays `https://chatgpt.com`. A loopback upstream is reached directly, request paths are forwarded unchanged, and the health endpoint reports the upstream in use.
+- An engine already running with a different upstream is replaced, not only one running different code.
+- `integrations/cc-switch/` adds a Windows corrector for cc-switch: after cc-switch puts its own `base_url` back into `[model_providers.custom]`, the corrector points it at the engine again. It acts only while the plugin's managed block is present, so the panel's *Disable plugin* still wins.
+
 ## [0.2.0] - 2026-09-29
 
 Filter the panel's list by where each image came from.
