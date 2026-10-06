@@ -9,6 +9,7 @@
         "CODEX_HOME",
         "CAM_DATA_DIR",
         "CAM_ENGINE_PORT",
+        "CAM_UPSTREAM_URL",
         "CODEX_MCP_NODE_PATH",
         "CODEX_BROWSER_USE_NODE_PATH",
         "CODEX_ELECTRON_RESOURCES_PATH",

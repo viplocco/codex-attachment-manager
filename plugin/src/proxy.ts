@@ -7,8 +7,9 @@
 // v0.1-11: pixel fingerprints go to the shared cache in the data directory, for the panels to reuse.
 // v0.1-14: the text for the model is in the language the panel last reported (Codex's interface language).
 // Only metadata is logged (never auth headers or conversation content).
-// Input: [--port 17891] [--stay (no auto-exit)] [--force-http] [--dump-requests (synthetic test threads only)];
-// the outbound proxy is taken from HTTPS_PROXY/HTTP_PROXY or the system proxy settings (Windows, macOS).
+// Input: [--port 17891] [--stay (no auto-exit)] [--force-http] [--dump-requests (synthetic test threads only)]
+// [--upstream URL]; the upstream defaults to https://chatgpt.com and can also come from CAM_UPSTREAM_URL. A loopback
+// upstream is reached directly; anything else uses HTTPS_PROXY/HTTP_PROXY or the system proxy settings (Windows, macOS).
 // Output: responses streamed back to Codex; <data dir>/proxy/<date>.jsonl; <data dir>/state/requests/<thread>.json.
 
 import { execFileSync } from "node:child_process";
@@ -32,16 +33,16 @@ import { rewriteItems, type Described } from "./rewrite.ts";
 import { connectDirectly, pluginGone, usesEngine } from "./setup.ts";
 import { effectiveSelection, selectionDir } from "./selection.ts";
 import { loadThreadIndex, pixelHashOf, setPixelCache, type ThreadIndex } from "./thread-index.ts";
+import { isLoopback, resolveUpstream, upstreamHostHeader, upstreamLabel, upstreamPath, type Upstream } from "./upstream.ts";
 
 type Json = Record<string, any>;
-const UPSTREAM_HOST = "chatgpt.com";
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "host"]);
 
 // Outbound proxy: environment first, then the system setting (Windows per-user, macOS); NO_PROXY is honoured for the
 // upstream host.
-export function outboundProxy(env = process.env, systemSetting = readSystemProxy): { host: string; port: number } | null {
+export function outboundProxy(env = process.env, systemSetting = readSystemProxy, upstreamHost = "chatgpt.com"): { host: string; port: number } | null {
   const noProxy = (env.NO_PROXY ?? env.no_proxy ?? "").split(",").map((s) => s.trim().replace(/^\./, "")).filter(Boolean);
-  if (noProxy.some((entry) => entry === "*" || UPSTREAM_HOST === entry || UPSTREAM_HOST.endsWith(`.${entry}`))) return null;
+  if (noProxy.some((entry) => entry === "*" || upstreamHost === entry || upstreamHost.endsWith(`.${entry}`))) return null;
   const fromEnv = env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy;
   let value = fromEnv || systemSetting();
   if (!value) return null;
@@ -76,14 +77,21 @@ export function macProxy(scutil: string): string | null {
   return null;
 }
 
-function connectUpstream(via: { host: string; port: number } | null): Promise<tls.TLSSocket> {
+function connectUpstream(upstream: Upstream, via: { host: string; port: number } | null): Promise<net.Socket | tls.TLSSocket> {
+  if (!upstream.secure) {
+    return new Promise<net.Socket>((ok, fail) => {
+      const socket = net.connect(upstream.port, upstream.host, () => ok(socket));
+      socket.once("error", fail);
+    });
+  }
   const startTls = (socket?: net.Socket) => new Promise<tls.TLSSocket>((ok, fail) => {
-    const secure = tls.connect({ socket, host: socket ? undefined : UPSTREAM_HOST, port: 443, servername: UPSTREAM_HOST, ALPNProtocols: ["http/1.1"] }, () => ok(secure));
+    const secure = tls.connect({ socket, host: socket ? undefined : upstream.host, port: upstream.port, servername: upstream.host, ALPNProtocols: ["http/1.1"] }, () => ok(secure));
     secure.once("error", fail);
   });
   if (!via) return startTls();
   return new Promise((ok, fail) => {
-    const socket = net.connect(via.port, via.host, () => socket.write(`CONNECT ${UPSTREAM_HOST}:443 HTTP/1.1\r\nHost: ${UPSTREAM_HOST}:443\r\n\r\n`));
+    const authority = `${upstream.host.includes(":") ? `[${upstream.host}]` : upstream.host}:${upstream.port}`;
+    const socket = net.connect(via.port, via.host, () => socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`));
     let buffered = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
       buffered = Buffer.concat([buffered, chunk]);
@@ -99,10 +107,10 @@ function connectUpstream(via: { host: string; port: number } | null): Promise<tl
   });
 }
 
-function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string | string[]> {
+function forwardHeaders(headers: IncomingHttpHeaders, upstream: Upstream): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [name, value] of Object.entries(headers)) if (value !== undefined && !HOP_BY_HOP.has(name)) out[name] = value;
-  out.host = UPSTREAM_HOST;
+  out.host = upstreamHostHeader(upstream);
   return out;
 }
 
@@ -240,13 +248,15 @@ async function main(): Promise<void> {
   const dumpDir = process.argv.includes("--dump-requests") ? join(dataDir(), "p2", "requests") : null;
   const sessionsDir = join(codexHome(), "sessions");
   setPixelCache(pixelCacheDirOf());
-  const via = outboundProxy();
+  const upstream = resolveUpstream();
+  // A loopback upstream is always reached directly; sending 127.0.0.1 through a system proxy would only fail.
+  const via = isLoopback(upstream) ? null : outboundProxy(process.env, readSystemProxy, upstream.host);
   const startedAt = new Date().toISOString();
   // v0.1-3: which code this engine runs, so the plugin can tell when an update needs a new engine.
   const build = buildOf();
   const version = versionOf();
   let sequence = 0;
-  log({ at: startedAt, event: "engine-start", pid: process.pid, port, build, version });
+  log({ at: startedAt, event: "engine-start", pid: process.pid, port, build, version, upstream: upstreamLabel(upstream), via: via ? `${via.host}:${via.port}` : "direct" });
   if (!process.argv.includes("--stay")) {
     // v0.1-5: a plugin removed or turned off without 停用 leaves Codex pointed at an engine nothing will start again.
     // Seen in two checks in a row (or once more as the engine exits, when Codex is gone and cannot be mid-write), Codex
@@ -321,7 +331,7 @@ async function main(): Promise<void> {
   const onRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     if (req.url === "/__cam/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, service: ENGINE_SERVICE, pid: process.pid, startedAt, port, build, version, upstream: UPSTREAM_HOST, via: via ? `${via.host}:${via.port}` : "direct" }));
+      res.end(JSON.stringify({ ok: true, service: ENGINE_SERVICE, pid: process.pid, startedAt, port, build, version, upstream: upstreamLabel(upstream), via: via ? `${via.host}:${via.port}` : "direct" }));
       return;
     }
     if (req.url === "/__cam/retire" && req.method === "POST") {
@@ -372,9 +382,9 @@ async function main(): Promise<void> {
       if (/\/responses$/.test(path)) recordRequest(identity.threadId, imageSizes ? { ...entry, imageSizes } : entry);
     };
     // body === null streams the request through unchanged.
-    const send = (headers: Record<string, string | string[]>, body: Buffer | null) => connectUpstream(via).then((socket) => {
+    const send = (headers: Record<string, string | string[]>, body: Buffer | null) => connectUpstream(upstream, via).then((socket) => {
       // No `agent` option: with agent:false Node ignores createConnection and dials the host directly.
-      const upstream = http.request({ host: UPSTREAM_HOST, method: req.method, path: req.url, headers, createConnection: () => socket }, (answer) => {
+      const request = http.request({ host: upstream.host, port: upstream.port, method: req.method, path: upstreamPath(upstream, req.url ?? "/"), headers, createConnection: () => socket }, (answer) => {
         status = answer.statusCode ?? 0;
         const headers: Record<string, string | string[]> = {};
         for (const [name, value] of Object.entries(answer.headers)) if (value !== undefined && !HOP_BY_HOP.has(name)) headers[name] = value;
@@ -384,17 +394,17 @@ async function main(): Promise<void> {
         answer.on("end", () => finish());
         answer.on("error", (error) => finish(String(error)));
       });
-      upstream.on("error", (error) => { if (!res.headersSent) res.writeHead(502); res.end(); finish(String(error)); });
+      request.on("error", (error) => { if (!res.headersSent) res.writeHead(502); res.end(); finish(String(error)); });
       // Codex may drop the connection mid-stream; still log the request once.
       res.on("close", () => finish(res.writableFinished ? undefined : "client closed before the response ended"));
-      if (body) upstream.end(body);
-      else { collect(); req.pipe(upstream); }
+      if (body) request.end(body);
+      else { collect(); req.pipe(request); }
     }, (error) => {
       res.writeHead(502, { "content-type": "text/plain" });
-      res.end(`codex-attachment-manager proxy: cannot reach ${UPSTREAM_HOST}`);
+      res.end(`codex-attachment-manager proxy: cannot reach ${upstreamLabel(upstream)}`);
       finish(String(error));
     });
-    if (!rewrite) { send(forwardHeaders(req.headers), null); return; }
+    if (!rewrite) { send(forwardHeaders(req.headers, upstream), null); return; }
     collect();
     req.on("end", () => {
       const original = Buffer.concat(chunks);
@@ -402,7 +412,7 @@ async function main(): Promise<void> {
       try { out = rewriteBody(original, req.headers["content-encoding"] as string | undefined, identity.threadId!, sessionsDir); }
       catch (error) { out = { body: original, report: { skipped: `rewrite failed: ${String(error)}` } }; }
       extra = { rewrite: out.report };
-      const headers = forwardHeaders(req.headers);
+      const headers = forwardHeaders(req.headers, upstream);
       headers["content-length"] = String(out.body.length);
       send(headers, out.body);
     });
@@ -426,7 +436,7 @@ async function main(): Promise<void> {
     let up = head.length;
     let down = 0;
     let upstreamStatus: string | null = null;
-    connectUpstream(via).then((socket) => {
+    connectUpstream(upstream, via).then((socket) => {
       const connection: Live = { client, socket, last: Date.now(), closedForSelection: false, activeWhileUnchecked: false, path, identity };
       sockets.add(connection);
       if (identity.threadId) {
@@ -437,10 +447,10 @@ async function main(): Promise<void> {
       const opened = { at: new Date(started).toISOString(), id, transport: "websocket", event: "open", path, ...identity };
       log(opened);
       recordRequest(identity.threadId, opened);
-      const lines = [`${req.method} ${req.url} HTTP/1.1`];
+      const lines = [`${req.method} ${upstreamPath(upstream, req.url ?? "/")} HTTP/1.1`];
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         const name = req.rawHeaders[i];
-        lines.push(`${name}: ${name.toLowerCase() === "host" ? UPSTREAM_HOST : req.rawHeaders[i + 1]}`);
+        lines.push(`${name}: ${name.toLowerCase() === "host" ? upstreamHostHeader(upstream) : req.rawHeaders[i + 1]}`);
       }
       socket.write(`${lines.join("\r\n")}\r\n\r\n`);
       if (head.length) socket.write(head);
@@ -487,7 +497,7 @@ async function main(): Promise<void> {
     server.listen(port, host, () => {
       servers.push(server);
       server.on("error", (error) => console.error(JSON.stringify({ host, error: String(error) })));
-      console.log(JSON.stringify({ listening: `http://${host.includes(":") ? `[${host}]` : host}:${port}/backend-api/codex`, upstream: UPSTREAM_HOST, via: via ? `${via.host}:${via.port}` : "direct" }));
+      console.log(JSON.stringify({ listening: `http://${host.includes(":") ? `[${host}]` : host}:${port}/backend-api/codex`, upstream: upstreamLabel(upstream), via: via ? `${via.host}:${via.port}` : "direct" }));
       resolve(true);
     });
   });
