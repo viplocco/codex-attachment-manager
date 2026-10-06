@@ -12,13 +12,14 @@ import { readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseUpstream, upstreamLabel } from "./upstream.ts";
 
 export const ENGINE_SERVICE = "codex-attachment-manager";
 export const DEFAULT_PORT = 17891;
 const here = dirname(fileURLToPath(import.meta.url));
 
 // build and version are missing on engines from before v0.1-3.
-export type Health = { ok: true; service: string; pid: number; startedAt: string; port: number; build?: string | null; version?: string | null };
+export type Health = { ok: true; service: string; pid: number; startedAt: string; port: number; build?: string | null; version?: string | null; upstream?: string | null; via?: string | null };
 export type EngineState = "running" | "started" | "replaced" | "failed";
 
 export function isEngineHealth(value: unknown): value is Health {
@@ -101,22 +102,27 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // The build of each runtime folder, read again once for every different build a running engine reports.
 const knownBuilds = new Map<string, { build: string | null; against: string | null | undefined }>();
 
-export async function ensureEngine(options: { port?: number; waitMs?: number; extraArgs?: string[]; dir?: string } = {}): Promise<{ state: EngineState; health: Health | null; replaced?: Health }> {
+export async function ensureEngine(options: { port?: number; waitMs?: number; extraArgs?: string[]; dir?: string; upstream?: string | null } = {}): Promise<{ state: EngineState; health: Health | null; replaced?: Health }> {
   const port = options.port ?? DEFAULT_PORT;
   const dir = options.dir ?? here;
+  // The upstream may change (a different provider switcher, or none); an engine serving the wrong one is replaced
+  // even when its code is unchanged. An engine from before this setting reports no upstream and is judged by code.
+  const wantedUpstream = options.upstream?.trim() || process.env.CAM_UPSTREAM_URL?.trim() || null;
+  const wantedLabel = upstreamLabel(parseUpstream(wantedUpstream));
   const existing = await engineHealth(port);
   let replaced: Health | undefined;
   if (existing) {
     const known = knownBuilds.get(dir);
     if (!known || (known.build !== existing.build && known.against !== existing.build)) knownBuilds.set(dir, { build: buildOf(dir), against: existing.build });
     const build = knownBuilds.get(dir)!.build;
-    if (build === existing.build || !shouldReplace(existing, { build, version: versionOf(dir) })) return { state: "running", health: existing };
+    const upstreamChanged = existing.upstream !== undefined && existing.upstream !== null && existing.upstream !== wantedLabel;
+    if (!upstreamChanged && (build === existing.build || !shouldReplace(existing, { build, version: versionOf(dir) }))) return { state: "running", health: existing };
     await retireEngine(port, existing, build);
     // A retiring engine closes its listener at once; a stopped one lets go of the port as it exits.
     for (let i = 0; i < 20 && (await engineHealth(port, 300))?.pid === existing.pid; i++) await sleep(150);
     replaced = existing;
   }
-  spawnEngine(port, options.extraArgs, dir);
+  spawnEngine(port, [...(wantedUpstream ? ["--upstream", wantedUpstream] : []), ...(options.extraArgs ?? [])], dir);
   const deadline = Date.now() + (options.waitMs ?? 8000);
   while (Date.now() < deadline) {
     await sleep(150);

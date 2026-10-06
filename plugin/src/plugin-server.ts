@@ -200,7 +200,7 @@ function main(): void {
     if (process.env.CAM_NO_ENGINE === "1") return;
     const result = await ensureEngine({ port: enginePort });
     const replaced = result.replaced ? { replacedPid: result.replaced.pid, replacedBuild: result.replaced.build ?? null } : {};
-    if (result.state !== "running" || engineState !== "running") log({ event: "engine", state: result.state, enginePid: result.health?.pid ?? null, build: result.health?.build ?? null, ...replaced });
+    if (result.state !== "running" || engineState !== "running") log({ event: "engine", state: result.state, enginePid: result.health?.pid ?? null, build: result.health?.build ?? null, upstream: result.health?.upstream ?? null, ...replaced });
     engineState = result.state;
     engineRunning = result.state !== "failed";
   };
